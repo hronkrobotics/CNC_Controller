@@ -54,14 +54,20 @@ public:
     void unlock();                       // $X
     void gotoWorkXY0();                  // G90 G0 X0 Y0 (no Z move)
 
-    // --- Job streaming ---
-    bool     startJob(const String &path);
+    // --- Job streaming (from any filesystem: SD or LittleFS) ---
+    bool     startJob(fs::FS &fs, const String &path);
     void     stopJob();                  // abort: soft-reset + cleanup
+    void     pauseJob();                  // feed-hold + stop feeding new lines
+    void     resumeJob();                 // resume motion + continue feeding
     bool     jobActive() const { return _job.active; }
+    bool     jobPaused() const { return _job.paused; }
     float    jobProgress() const;        // 0..1
     uint32_t jobLinesDone() const { return _job.linesDone; }
     uint32_t jobTotalLines() const { return _job.totalLines; }
     const String &jobName() const { return _job.name; }
+
+    // Depth of the outbound line queue (for USB/WiFi stream backpressure).
+    size_t   queueDepth() const { return _txQueue.size(); }
 
     const GrblSnapshot &status() const { return _snap; }
     void onLog(LogFn fn) { _log = fn; }
@@ -94,6 +100,7 @@ private:
     struct Job {
         bool     active = false;
         bool     reading = false;
+        bool     paused = false;
         File     file;
         String   name;
         String   path;

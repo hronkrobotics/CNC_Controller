@@ -1,5 +1,4 @@
 #include "grbl.h"
-#include <LittleFS.h>
 
 GrblController Grbl;
 
@@ -19,8 +18,8 @@ void GrblController::update()
         handleByte((uint8_t)GRBL_UART.read());
     }
 
-    // Feed the job stream if we have room.
-    if (_job.active && _job.reading) {
+    // Feed the job stream if we have room (paused jobs stop feeding new lines).
+    if (_job.active && _job.reading && !_job.paused) {
         feedJob();
     }
 
@@ -67,6 +66,7 @@ void GrblController::softReset()
         if (_job.file) _job.file.close();
         _job.active = false;
         _job.reading = false;
+        _job.paused = false;
     }
 }
 
@@ -289,11 +289,11 @@ String GrblController::stripGcodeLine(const String &raw)
     return out;
 }
 
-bool GrblController::startJob(const String &path)
+bool GrblController::startJob(fs::FS &fs, const String &path)
 {
     if (_job.active) return false;
 
-    File f = LittleFS.open(path, "r");
+    File f = fs.open(path, "r");
     if (!f) {
         if (_log) _log("[cannot open " + path + "]", false);
         return false;
@@ -307,7 +307,7 @@ bool GrblController::startJob(const String &path)
     }
     f.close();
 
-    _job.file = LittleFS.open(path, "r");
+    _job.file = fs.open(path, "r");
     if (!_job.file) return false;
 
     _job.path       = path;
@@ -315,9 +315,26 @@ bool GrblController::startJob(const String &path)
     _job.totalLines = total;
     _job.linesDone  = 0;
     _job.reading    = true;
+    _job.paused     = false;
     _job.active     = true;
     if (_log) _log("[job started: " + _job.name + " (" + String(total) + " lines)]", false);
     return true;
+}
+
+void GrblController::pauseJob()
+{
+    if (!_job.active || _job.paused) return;
+    _job.paused = true;
+    feedHold();                          // '!' - pause motion; buffer is retained
+    if (_log) _log("[job paused]", false);
+}
+
+void GrblController::resumeJob()
+{
+    if (!_job.active || !_job.paused) return;
+    _job.paused = false;
+    resume();                            // '~' - resume motion
+    if (_log) _log("[job resumed]", false);
 }
 
 void GrblController::feedJob()

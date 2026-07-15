@@ -1,439 +1,809 @@
 #include "ui.h"
-#include "grbl.h"
 #include <lvgl.h>
+#include <deque>
+#include <vector>
+#include "config.h"
+#include "grbl.h"
+#include "jobstore.h"
+#include "wifimgr.h"
 
-// ---------------------------------------------------------------------------
-//  Action codes carried in each widget's user_data
-// ---------------------------------------------------------------------------
-enum Action {
-    ACT_HOLD = 1, ACT_RESUME, ACT_RESET, ACT_UNLOCK, ACT_HOME,
-    ACT_ZERO_X, ACT_ZERO_Y, ACT_ZERO_Z, ACT_ZERO_ALL, ACT_GOXY0,
-    ACT_JOG_XP, ACT_JOG_XN, ACT_JOG_YP, ACT_JOG_YN, ACT_JOG_ZP, ACT_JOG_ZN,
-    ACT_JOB_RUN, ACT_JOB_STOP, ACT_JOB_DELETE, ACT_JOB_REFRESH,
-    ACT_CONSOLE_CLEAR,
+// Fallback jog defaults (keep the UI compiling regardless of config.h revision).
+#ifndef JOG_STEP_DEFAULT
+#define JOG_STEP_DEFAULT 1.0f
+#endif
+#ifndef JOG_FEED_DEFAULT
+#define JOG_FEED_DEFAULT 1000.0f
+#endif
+#ifndef JOG_CONTINUOUS_DIST
+#define JOG_CONTINUOUS_DIST 1000.0f
+#endif
+
+// ===========================================================================
+//  THEME / PALETTE
+// ===========================================================================
+#define COL_BG        lv_color_hex(0x15181C)
+#define COL_BG2       lv_color_hex(0x1B1F24)
+#define COL_PANEL     lv_color_hex(0x242A31)
+#define COL_PANEL_HI  lv_color_hex(0x2E353D)
+#define COL_LINE      lv_color_hex(0x333B44)
+#define COL_ACCENT    lv_color_hex(0x17C3B2)
+#define COL_TEXT      lv_color_hex(0xE6E9ED)
+#define COL_MUTED     lv_color_hex(0x8A929B)
+
+#define COL_IDLE      lv_color_hex(0x2EA043)
+#define COL_RUN       lv_color_hex(0x2F81F7)
+#define COL_HOLD      lv_color_hex(0xFFB300)
+#define COL_ALARM     lv_color_hex(0xE5484D)
+#define COL_OFF       lv_color_hex(0x3A424B)
+
+// ===========================================================================
+//  FONT SET  -- UNIFIED on Montserrat (ZERO mixed-font patchwork)
+// ===========================================================================
+//  The earlier build mixed a pixel-mono (UNSCII) font with Montserrat, which
+//  looked like a patchwork. lv_font_conv (node/npm) is not available in this
+//  environment, so a proper "techy" TTF (Share Tech Mono / DSEG7) cannot be
+//  generated here. We therefore unify the ENTIRE UI on one family - Montserrat
+//  - at a range of sizes. Every text element routes through a FONT_* define.
+//
+//  TODO (techy pass): generate an LVGL font from Share Tech Mono (labels) and
+//  DSEG7 (DRO digits) with lv_font_conv, add them to lv_conf.h, and repoint
+//  FONT_DRO / FONT_H1 / FONT_BTN below. Nothing else needs to change.
+#define FONT_DRO   &lv_font_montserrat_44   // big DRO digits
+#define FONT_LG    &lv_font_montserrat_28   // axis letters, jog arrows
+#define FONT_H1    &lv_font_montserrat_22   // state chip, section headers, tabs
+#define FONT_BTN   &lv_font_montserrat_16   // button labels
+#define FONT_MD    &lv_font_montserrat_16   // dropdowns, inputs
+#define FONT_SM    &lv_font_montserrat_14   // secondary text, net indicator
+#define FONT_HBAR  &lv_font_montserrat_14   // ALL top-bar text (uniform size)
+#define FONT_MONO  &lv_font_montserrat_14   // console (unified; techy TODO above)
+#define FONT_TINY  &lv_font_montserrat_12   // segmented toggle, small chips
+
+// ===========================================================================
+//  Right-column layout grid (uniform margins + gutters)
+// ===========================================================================
+static const int RX0 = 484, RW = 308, GAP = 8;
+static inline int cellW(int n)        { return (RW - (n - 1) * GAP) / n; }
+static inline int cellX(int i, int n) { return RX0 + i * (cellW(n) + GAP); }
+
+// ===========================================================================
+//  State + widgets
+// ===========================================================================
+static float g_step     = JOG_STEP_DEFAULT;
+static float g_feed     = JOG_FEED_DEFAULT;
+static bool  g_showWork = true;
+
+static lv_obj_t *g_views[3];              // 0 = Control, 1 = Jobs, 2 = WiFi
+static lv_obj_t *g_tabBtns[2];            // CONTROL / JOBS
+static lv_obj_t *g_netBtn, *g_netLbl;
+
+static lv_obj_t *g_stateChip, *g_stateLbl;
+static lv_obj_t *g_axisBig[3], *g_axisSmall[3];
+static lv_obj_t *g_posToggle;
+static lv_obj_t *g_jobStripLbl;
+static lv_obj_t *g_console;
+
+// Jobs view
+static lv_obj_t *g_jobList, *g_jobCurLbl, *g_jobBar, *g_jobPctLbl;
+static std::vector<String> g_jobPaths;
+
+// WiFi view
+static lv_obj_t *g_wifiStatus, *g_ssidDrop, *g_pass, *g_kb;
+static std::vector<WifiScanResult> g_ssids;
+static bool g_scanPending = false;
+
+static std::deque<String> g_log;
+
+enum Cmd {
+    CMD_ZERO_X, CMD_ZERO_Y, CMD_ZERO_Z, CMD_ZERO_ALL,
+    CMD_HOME_XY, CMD_HOME_Z, CMD_HOME_ALL, CMD_UNLOCK,
+    CMD_HOLD, CMD_RESUME, CMD_STOP,
+    CMD_JOB_PAUSE, CMD_JOB_RESUME, CMD_JOB_STOP,
+    CMD_WIFI_SCAN, CMD_WIFI_CONNECT, CMD_WIFI_FORGET, CMD_JOB_REFRESH
 };
 
-// ---------------------------------------------------------------------------
-//  Widget handles + UI state
-// ---------------------------------------------------------------------------
-namespace {
+static inline intptr_t jogCode(int axis, int sign) { return (axis << 1) | (sign > 0 ? 1 : 0); }
 
-lv_obj_t *g_stateChip  = nullptr;
-lv_obj_t *g_stateLabel = nullptr;
-lv_obj_t *g_wifiLabel  = nullptr;
+static void show_view(int i);
+static void rebuild_job_list();
 
-lv_obj_t *g_droVal[3]  = {nullptr, nullptr, nullptr};
-lv_obj_t *g_mposLabel  = nullptr;
-
-lv_obj_t *g_stepMtx    = nullptr;
-lv_obj_t *g_feedMtx    = nullptr;
-
-lv_obj_t *g_jobList    = nullptr;
-lv_obj_t *g_selLabel   = nullptr;
-lv_obj_t *g_runBtn     = nullptr;
-lv_obj_t *g_progBar    = nullptr;
-lv_obj_t *g_progLabel  = nullptr;
-
-lv_obj_t *g_console    = nullptr;
-
-float  g_step = JOG_STEP_DEFAULT;
-float  g_feed = JOG_FEED_DEFAULT;
-String g_selName;
-
-const char *g_stepMap[] = {"0.1", "1", "10", ""};
-const char *g_feedMap[] = {"100", "500", "1000", "2000", ""};
-
-// colour palette
-inline lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
-
-// ---- small styling helpers ----------------------------------------------
-void styleButton(lv_obj_t *btn, uint32_t bg)
+// ===========================================================================
+//  Event handlers  (UI runs on the GRBL task, so it calls Grbl directly)
+// ===========================================================================
+static void cmd_cb(lv_event_t *e)
 {
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_set_style_bg_color(btn, C(bg), 0);
-    lv_obj_set_style_bg_color(btn, C(0xffffff), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(btn, 0, 0);
-}
-
-lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h,
-                     Action act, const lv_font_t *font, uint32_t bg, lv_event_cb_t cb)
-{
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_pos(btn, x, y);
-    lv_obj_set_size(btn, w, h);
-    styleButton(btn, bg);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)(intptr_t)act);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, text);
-    if (font) lv_obj_set_style_text_font(lbl, font, 0);
-    lv_obj_center(lbl);
-    return btn;
-}
-
-// ---- forward decls --------------------------------------------------------
-void refreshJobList();
-
-// ---- event handlers -------------------------------------------------------
-void actionCb(lv_event_t *e)
-{
-    Action act = (Action)(intptr_t)lv_event_get_user_data(e);
-    switch (act) {
-        case ACT_HOLD:      Grbl.feedHold();               break;
-        case ACT_RESUME:    Grbl.resume();                 break;
-        case ACT_RESET:     Grbl.softReset();              break;
-        case ACT_UNLOCK:    Grbl.unlock();                 break;
-        case ACT_HOME:      Grbl.home();                   break;
-        case ACT_ZERO_X:    Grbl.zeroAxis('X');            break;
-        case ACT_ZERO_Y:    Grbl.zeroAxis('Y');            break;
-        case ACT_ZERO_Z:    Grbl.zeroAxis('Z');            break;
-        case ACT_ZERO_ALL:  Grbl.zeroAll();                break;
-        case ACT_GOXY0:     Grbl.gotoWorkXY0();            break;
-        case ACT_JOG_XP:    Grbl.jog('X',  g_step, g_feed); break;
-        case ACT_JOG_XN:    Grbl.jog('X', -g_step, g_feed); break;
-        case ACT_JOG_YP:    Grbl.jog('Y',  g_step, g_feed); break;
-        case ACT_JOG_YN:    Grbl.jog('Y', -g_step, g_feed); break;
-        case ACT_JOG_ZP:    Grbl.jog('Z',  g_step, g_feed); break;
-        case ACT_JOG_ZN:    Grbl.jog('Z', -g_step, g_feed); break;
-        case ACT_JOB_STOP:  Grbl.stopJob();                break;
-        case ACT_JOB_RUN:
-            if (g_selName.length() && !Grbl.jobActive() && !WebUI::isUploading()) {
-                Grbl.startJob(JobStore::fullPath(g_selName));
+    switch ((intptr_t)lv_event_get_user_data(e)) {
+        case CMD_ZERO_X:     Grbl.zeroAxis('X'); break;
+        case CMD_ZERO_Y:     Grbl.zeroAxis('Y'); break;
+        case CMD_ZERO_Z:     Grbl.zeroAxis('Z'); break;
+        case CMD_ZERO_ALL:   Grbl.zeroAll();     break;
+        case CMD_HOME_ALL:   Grbl.home();        break;
+        case CMD_HOME_XY:    Grbl.sendLine("$HX"); Grbl.sendLine("$HY"); break;
+        case CMD_HOME_Z:     Grbl.sendLine("$HZ"); break;
+        case CMD_UNLOCK:     Grbl.unlock();      break;
+        case CMD_HOLD:       Grbl.feedHold();    break;
+        case CMD_RESUME:     Grbl.resume();      break;
+        case CMD_STOP:       Grbl.softReset();   break;
+        case CMD_JOB_PAUSE:  Grbl.pauseJob();    break;
+        case CMD_JOB_RESUME: Grbl.resumeJob();   break;
+        case CMD_JOB_STOP:   Grbl.stopJob();     break;
+        case CMD_JOB_REFRESH: rebuild_job_list(); break;
+        case CMD_WIFI_SCAN:  wifi_scan_start(); g_scanPending = true; break;
+        case CMD_WIFI_FORGET: wifi_forget(); break;
+        case CMD_WIFI_CONNECT: {
+            if (g_ssidDrop && g_pass) {
+                char ssid[40];
+                lv_dropdown_get_selected_str(g_ssidDrop, ssid, sizeof(ssid));
+                wifi_connect(String(ssid), String(lv_textarea_get_text(g_pass)));
             }
             break;
-        case ACT_JOB_DELETE:
-            if (g_selName.length() && !Grbl.jobActive()) {
-                JobStore::remove(g_selName);
-                g_selName = "";
-                if (g_selLabel) lv_label_set_text(g_selLabel, "No file selected");
-                refreshJobList();
-            }
-            break;
-        default: break;
-    }
-}
-
-void consoleClearCb(lv_event_t *e)
-{
-    if (g_console) lv_textarea_set_text(g_console, "");
-}
-
-void stepMtxCb(lv_event_t *e)
-{
-    lv_obj_t *m = lv_event_get_target(e);
-    uint16_t id = lv_btnmatrix_get_selected_btn(m);
-    const char *t = lv_btnmatrix_get_btn_text(m, id);
-    if (t) g_step = atof(t);
-}
-
-void feedMtxCb(lv_event_t *e)
-{
-    lv_obj_t *m = lv_event_get_target(e);
-    uint16_t id = lv_btnmatrix_get_selected_btn(m);
-    const char *t = lv_btnmatrix_get_btn_text(m, id);
-    if (t) g_feed = atof(t);
-}
-
-void jobItemCb(lv_event_t *e)
-{
-    lv_obj_t *btn = lv_event_get_target(e);
-    const char *txt = lv_list_get_btn_text(g_jobList, btn);
-    if (txt) {
-        g_selName = txt;
-        if (g_selLabel) lv_label_set_text_fmt(g_selLabel, "Selected: %s", txt);
-    }
-}
-
-void jobRefreshCb(lv_event_t *e) { refreshJobList(); }
-
-void refreshJobList()
-{
-    if (!g_jobList) return;
-    lv_obj_clean(g_jobList);
-    auto files = JobStore::list();
-    for (auto &f : files) {
-        lv_obj_t *b = lv_list_add_btn(g_jobList, LV_SYMBOL_FILE, f.name.c_str());
-        lv_obj_add_event_cb(b, jobItemCb, LV_EVENT_CLICKED, nullptr);
-    }
-    if (files.empty()) {
-        lv_list_add_text(g_jobList, "No jobs. Upload over WiFi.");
-    }
-}
-
-// ---- screen construction --------------------------------------------------
-void buildTopBar(lv_obj_t *scr)
-{
-    lv_obj_t *bar = lv_obj_create(scr);
-    lv_obj_set_pos(bar, 0, 0);
-    lv_obj_set_size(bar, 800, 60);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_style_bg_color(bar, C(0x0f1218), 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
-    lv_obj_set_style_pad_all(bar, 0, 0);
-
-    g_stateChip = lv_obj_create(bar);
-    lv_obj_set_pos(g_stateChip, 8, 8);
-    lv_obj_set_size(g_stateChip, 180, 44);
-    lv_obj_clear_flag(g_stateChip, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(g_stateChip, 8, 0);
-    lv_obj_set_style_border_width(g_stateChip, 0, 0);
-    lv_obj_set_style_bg_color(g_stateChip, C(0x7f8c8d), 0);
-    g_stateLabel = lv_label_create(g_stateChip);
-    lv_obj_set_style_text_font(g_stateLabel, &lv_font_montserrat_24, 0);
-    lv_label_set_text(g_stateLabel, "---");
-    lv_obj_center(g_stateLabel);
-
-    g_wifiLabel = lv_label_create(bar);
-    lv_obj_set_pos(g_wifiLabel, 200, 12);
-    lv_obj_set_style_text_font(g_wifiLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(g_wifiLabel, C(0x9aa4b6), 0);
-    lv_label_set_text(g_wifiLabel, "WiFi ...");
-
-    makeButton(bar, "HOLD",  506, 8, 90, 44, ACT_HOLD,   &lv_font_montserrat_16, 0xe67e22, actionCb);
-    makeButton(bar, "RESUME",604, 8, 90, 44, ACT_RESUME, &lv_font_montserrat_16, 0x27ae60, actionCb);
-    makeButton(bar, "RESET", 702, 8, 90, 44, ACT_RESET,  &lv_font_montserrat_16, 0xc0392b, actionCb);
-}
-
-void makeAxisRow(lv_obj_t *parent, const char *axis, int y, int idx)
-{
-    lv_obj_t *a = lv_label_create(parent);
-    lv_obj_set_pos(a, 6, y + 10);
-    lv_obj_set_style_text_font(a, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(a, C(0x6fa8ff), 0);
-    lv_label_set_text(a, axis);
-
-    lv_obj_t *v = lv_label_create(parent);
-    lv_obj_set_pos(v, 60, y);
-    lv_obj_set_size(v, 290, 50);
-    lv_obj_set_style_text_font(v, &lv_font_montserrat_40, 0);
-    lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_label_set_text(v, "0.000");
-    g_droVal[idx] = v;
-}
-
-void buildControlTab(lv_obj_t *tab)
-{
-    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(tab, 6, 0);
-
-    // ---- DRO panel ----
-    lv_obj_t *dro = lv_obj_create(tab);
-    lv_obj_set_pos(dro, 0, 0);
-    lv_obj_set_size(dro, 360, 200);
-    lv_obj_clear_flag(dro, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(dro, C(0x1b1f2a), 0);
-    lv_obj_set_style_border_width(dro, 0, 0);
-    lv_obj_set_style_pad_all(dro, 4, 0);
-    makeAxisRow(dro, "X", 6, 0);
-    makeAxisRow(dro, "Y", 62, 1);
-    makeAxisRow(dro, "Z", 118, 2);
-    g_mposLabel = lv_label_create(dro);
-    lv_obj_set_pos(g_mposLabel, 6, 172);
-    lv_obj_set_style_text_font(g_mposLabel, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(g_mposLabel, C(0x8a93a6), 0);
-    lv_label_set_text(g_mposLabel, "M: 0.000  0.000  0.000");
-
-    // ---- jog pad ----
-    lv_obj_t *jog = lv_obj_create(tab);
-    lv_obj_set_pos(jog, 365, 0);
-    lv_obj_set_size(jog, 415, 200);
-    lv_obj_clear_flag(jog, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(jog, C(0x1b1f2a), 0);
-    lv_obj_set_style_border_width(jog, 0, 0);
-    lv_obj_set_style_pad_all(jog, 4, 0);
-    const lv_font_t *jf = &lv_font_montserrat_20;
-    makeButton(jog, "Y+", 95,   4, 76, 52, ACT_JOG_YP, jf, 0x2f6bff, actionCb);
-    makeButton(jog, "X-", 10,  64, 76, 52, ACT_JOG_XN, jf, 0x2f6bff, actionCb);
-    makeButton(jog, "X+", 180, 64, 76, 52, ACT_JOG_XP, jf, 0x2f6bff, actionCb);
-    makeButton(jog, "Y-", 95, 124, 76, 52, ACT_JOG_YN, jf, 0x2f6bff, actionCb);
-    makeButton(jog, "Z+", 320,  4, 76, 52, ACT_JOG_ZP, jf, 0x8e44ad, actionCb);
-    makeButton(jog, "Z-", 320,124, 76, 52, ACT_JOG_ZN, jf, 0x8e44ad, actionCb);
-
-    // ---- step / feed selectors ----
-    lv_obj_t *stepCap = lv_label_create(tab);
-    lv_obj_set_pos(stepCap, 4, 202);
-    lv_obj_set_style_text_font(stepCap, &lv_font_montserrat_14, 0);
-    lv_label_set_text(stepCap, "STEP (mm)");
-    lv_obj_t *feedCap = lv_label_create(tab);
-    lv_obj_set_pos(feedCap, 400, 202);
-    lv_obj_set_style_text_font(feedCap, &lv_font_montserrat_14, 0);
-    lv_label_set_text(feedCap, "FEED (mm/min)");
-
-    g_stepMtx = lv_btnmatrix_create(tab);
-    lv_btnmatrix_set_map(g_stepMtx, g_stepMap);
-    lv_obj_set_pos(g_stepMtx, 0, 220);
-    lv_obj_set_size(g_stepMtx, 388, 44);
-    lv_btnmatrix_set_one_checked(g_stepMtx, true);
-    lv_btnmatrix_set_btn_ctrl_all(g_stepMtx, LV_BTNMATRIX_CTRL_CHECKABLE);
-    lv_btnmatrix_set_btn_ctrl(g_stepMtx, 1, LV_BTNMATRIX_CTRL_CHECKED);  // "1"
-    lv_obj_add_event_cb(g_stepMtx, stepMtxCb, LV_EVENT_VALUE_CHANGED, nullptr);
-
-    g_feedMtx = lv_btnmatrix_create(tab);
-    lv_btnmatrix_set_map(g_feedMtx, g_feedMap);
-    lv_obj_set_pos(g_feedMtx, 396, 220);
-    lv_obj_set_size(g_feedMtx, 388, 44);
-    lv_btnmatrix_set_one_checked(g_feedMtx, true);
-    lv_btnmatrix_set_btn_ctrl_all(g_feedMtx, LV_BTNMATRIX_CTRL_CHECKABLE);
-    lv_btnmatrix_set_btn_ctrl(g_feedMtx, 2, LV_BTNMATRIX_CTRL_CHECKED);  // "1000"
-    lv_obj_add_event_cb(g_feedMtx, feedMtxCb, LV_EVENT_VALUE_CHANGED, nullptr);
-
-    // ---- action buttons ----
-    const lv_font_t *af = &lv_font_montserrat_14;
-    int y = 300, w = 104, h = 52, gap = 8, x = 4;
-    makeButton(tab, "Zero X",  x + 0 * (w + gap), y, w, h, ACT_ZERO_X,   af, 0x34495e, actionCb);
-    makeButton(tab, "Zero Y",  x + 1 * (w + gap), y, w, h, ACT_ZERO_Y,   af, 0x34495e, actionCb);
-    makeButton(tab, "Zero Z",  x + 2 * (w + gap), y, w, h, ACT_ZERO_Z,   af, 0x34495e, actionCb);
-    makeButton(tab, "Zero All",x + 3 * (w + gap), y, w, h, ACT_ZERO_ALL, af, 0x16a085, actionCb);
-    makeButton(tab, "Home",    x + 4 * (w + gap), y, w, h, ACT_HOME,     af, 0x2f6bff, actionCb);
-    makeButton(tab, "Unlock",  x + 5 * (w + gap), y, w, h, ACT_UNLOCK,   af, 0xd35400, actionCb);
-    makeButton(tab, "Go XY0",  x + 6 * (w + gap), y, w, h, ACT_GOXY0,    af, 0x34495e, actionCb);
-}
-
-void buildJobsTab(lv_obj_t *tab)
-{
-    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(tab, 6, 0);
-
-    g_jobList = lv_list_create(tab);
-    lv_obj_set_pos(g_jobList, 0, 0);
-    lv_obj_set_size(g_jobList, 470, 360);
-    lv_obj_set_style_bg_color(g_jobList, C(0x1b1f2a), 0);
-
-    g_selLabel = lv_label_create(tab);
-    lv_obj_set_pos(g_selLabel, 480, 4);
-    lv_obj_set_width(g_selLabel, 300);
-    lv_label_set_long_mode(g_selLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(g_selLabel, &lv_font_montserrat_20, 0);
-    lv_label_set_text(g_selLabel, "No file selected");
-
-    const lv_font_t *bf = &lv_font_montserrat_16;
-    g_runBtn = makeButton(tab, "RUN",     480, 90,  140, 56, ACT_JOB_RUN,   bf, 0x27ae60, actionCb);
-    makeButton(tab, "STOP",    640, 90,  140, 56, ACT_JOB_STOP,   bf, 0xc0392b, actionCb);
-    makeButton(tab, "Delete",  480, 156, 140, 44, ACT_JOB_DELETE, bf, 0x34495e, actionCb);
-    makeButton(tab, "Refresh", 640, 156, 140, 44, ACT_JOB_REFRESH,bf, 0x34495e, jobRefreshCb);
-
-    g_progBar = lv_bar_create(tab);
-    lv_obj_set_pos(g_progBar, 480, 224);
-    lv_obj_set_size(g_progBar, 300, 16);
-    lv_bar_set_range(g_progBar, 0, 100);
-    lv_bar_set_value(g_progBar, 0, LV_ANIM_OFF);
-
-    g_progLabel = lv_label_create(tab);
-    lv_obj_set_pos(g_progLabel, 480, 250);
-    lv_obj_set_style_text_font(g_progLabel, &lv_font_montserrat_16, 0);
-    lv_label_set_text(g_progLabel, "idle");
-
-    lv_obj_t *hint = lv_label_create(tab);
-    lv_obj_set_pos(hint, 480, 300);
-    lv_obj_set_width(hint, 300);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(hint, C(0x8a93a6), 0);
-    lv_label_set_text_fmt(hint, "Upload jobs over WiFi:\nJoin '%s' then open http://%s",
-                          WebUI::ssid().c_str(), WebUI::ipAddress().c_str());
-
-    refreshJobList();
-}
-
-void buildConsoleTab(lv_obj_t *tab)
-{
-    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(tab, 6, 0);
-
-    g_console = lv_textarea_create(tab);
-    lv_obj_set_pos(g_console, 0, 0);
-    lv_obj_set_size(g_console, 780, 310);
-    lv_textarea_set_max_length(g_console, 6000);
-    lv_textarea_set_cursor_click_pos(g_console, false);
-    lv_obj_set_style_text_font(g_console, &lv_font_montserrat_14, 0);
-
-    makeButton(tab, "Clear", 0, 320, 120, 40, ACT_CONSOLE_CLEAR, &lv_font_montserrat_16,
-               0x34495e, consoleClearCb);
-}
-
-}  // namespace
-
-// ---------------------------------------------------------------------------
-//  Public API
-// ---------------------------------------------------------------------------
-void Ui::create()
-{
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, C(0x12151c), 0);
-
-    buildTopBar(scr);
-
-    lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, 44);
-    lv_obj_set_pos(tv, 0, 60);
-    lv_obj_set_size(tv, 800, 420);
-    lv_obj_set_style_bg_color(tv, C(0x12151c), 0);
-
-    buildControlTab(lv_tabview_add_tab(tv, "Control"));
-    buildJobsTab(lv_tabview_add_tab(tv, "Jobs"));
-    buildConsoleTab(lv_tabview_add_tab(tv, "Console"));
-}
-
-void Ui::tick()
-{
-    const GrblSnapshot &s = Grbl.status();
-
-    // state chip
-    uint32_t col = 0x7f8c8d;
-    const char *name = s.stateName;
-    if (!s.connected) { col = 0x7f8c8d; name = "NO LINK"; }
-    else switch (s.state) {
-        case GrblState::Idle:  col = 0x27ae60; break;
-        case GrblState::Run:
-        case GrblState::Jog:
-        case GrblState::Home:  col = 0x2f6bff; break;
-        case GrblState::Hold:
-        case GrblState::Door:  col = 0xe67e22; break;
-        case GrblState::Alarm: col = 0xc0392b; break;
-        default:               col = 0x7f8c8d; break;
-    }
-    if (g_stateChip)  lv_obj_set_style_bg_color(g_stateChip, C(col), 0);
-    if (g_stateLabel) lv_label_set_text(g_stateLabel, name);
-
-    // DRO
-    char buf[24];
-    for (int i = 0; i < 3; i++) {
-        if (!g_droVal[i]) continue;
-        snprintf(buf, sizeof(buf), "%.3f", s.wpos[i]);
-        lv_label_set_text(g_droVal[i], buf);
-    }
-    if (g_mposLabel) {
-        lv_label_set_text_fmt(g_mposLabel, "M: %.3f  %.3f  %.3f",
-                              s.mpos[0], s.mpos[1], s.mpos[2]);
-    }
-
-    // wifi label (static content, cheap to refresh)
-    if (g_wifiLabel) {
-        lv_label_set_text_fmt(g_wifiLabel, "WiFi: %s\n%s",
-                              WebUI::ssid().c_str(), WebUI::ipAddress().c_str());
-    }
-
-    // job progress
-    if (g_progBar && g_progLabel) {
-        if (Grbl.jobActive()) {
-            int pct = (int)(Grbl.jobProgress() * 100);
-            lv_bar_set_value(g_progBar, pct, LV_ANIM_OFF);
-            lv_label_set_text_fmt(g_progLabel, "%s  line %u/%u  %d%%",
-                                  Grbl.jobName().c_str(),
-                                  (unsigned)Grbl.jobLinesDone(),
-                                  (unsigned)Grbl.jobTotalLines(), pct);
-        } else if (WebUI::isUploading()) {
-            lv_label_set_text(g_progLabel, "uploading...");
         }
     }
 }
 
-void Ui::logLine(const String &line, bool outgoing)
+static void jog_cb(lv_event_t *e)
+{
+    intptr_t code = (intptr_t)lv_event_get_user_data(e);
+    int axis = code >> 1, sign = (code & 1) ? 1 : -1;
+    char ax = "XYZ"[axis];
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) Grbl.jog(ax, sign * g_step, g_feed);
+}
+
+static void dist_cb(lv_event_t *e)
+{
+    char buf[16];
+    lv_dropdown_get_selected_str(lv_event_get_target(e), buf, sizeof(buf));
+    g_step = atof(buf);
+}
+
+static void feed_cb(lv_event_t *e)
+{
+    char buf[16];
+    lv_dropdown_get_selected_str(lv_event_get_target(e), buf, sizeof(buf));
+    g_feed = atof(buf);
+}
+
+static void posmode_cb(lv_event_t *e)
+{
+    g_showWork = (lv_btnmatrix_get_selected_btn(lv_event_get_target(e)) == 0);
+}
+
+static void tab_cb(lv_event_t *e) { show_view((intptr_t)lv_event_get_user_data(e)); }
+static void net_cb(lv_event_t *e) { (void)e; show_view(2); }
+
+static void run_job_cb(lv_event_t *e)
+{
+    intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (intptr_t)g_jobPaths.size()) return;
+    fs::FS *fs = nullptr;
+    String real;
+    if (store_resolve(g_jobPaths[idx], fs, real) && fs) Grbl.startJob(*fs, real);
+    show_view(0);                                   // jump to control to watch
+}
+
+static void del_job_cb(lv_event_t *e)
+{
+    intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (intptr_t)g_jobPaths.size()) return;
+    store_delete(g_jobPaths[idx]);
+    rebuild_job_list();
+}
+
+static void kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t c = lv_event_get_code(e);
+    if (c == LV_EVENT_READY || c == LV_EVENT_CANCEL)
+        lv_obj_add_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void pass_focus_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        lv_keyboard_set_textarea(g_kb, g_pass);
+        lv_obj_clear_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// ===========================================================================
+//  Styling helpers
+// ===========================================================================
+static void style_btn(lv_obj_t *b, lv_color_t base)
+{
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_bg_color(b, base, 0);
+    lv_obj_set_style_bg_color(b, lv_color_lighten(base, 35), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, COL_LINE, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_text_color(b, COL_TEXT, 0);
+}
+
+static lv_obj_t *make_btn(lv_obj_t *parent, const char *text, int x, int y, int w, int h,
+                          lv_color_t base, lv_event_cb_t cb, intptr_t code,
+                          const lv_font_t *font, lv_color_t txt = COL_TEXT)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_pos(b, x, y);
+    style_btn(b, base);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)code);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, txt, 0);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static lv_obj_t *make_panel(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *p = lv_obj_create(parent);
+    lv_obj_set_size(p, w, h);
+    lv_obj_set_pos(p, x, y);
+    lv_obj_set_style_bg_color(p, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(p, 1, 0);
+    lv_obj_set_style_border_color(p, COL_LINE, 0);
+    lv_obj_set_style_radius(p, 8, 0);
+    lv_obj_set_style_pad_all(p, 0, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    return p;
+}
+
+static lv_obj_t *make_hdr(lv_obj_t *parent, const char *text, int x, int y)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_color(l, COL_MUTED, 0);
+    lv_obj_set_style_text_font(l, FONT_SM, 0);
+    lv_obj_set_pos(l, x, y);
+    return l;
+}
+
+// ===========================================================================
+//  Header
+// ===========================================================================
+static void build_header(lv_obj_t *scr)
+{
+    lv_obj_t *bar = lv_obj_create(scr);
+    lv_obj_set_size(bar, 800, 56);
+    lv_obj_set_pos(bar, 0, 0);
+    lv_obj_set_style_bg_color(bar, COL_BG2, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Whole top bar routes through one size (FONT_HBAR) so every header element
+    // matches the state chip's "DISCONNECTED" text - no mixed sizes up here.
+    make_btn(bar, "HOLD",   8,   8, 70,  40, COL_HOLD,  cmd_cb, CMD_HOLD,   FONT_HBAR, lv_color_hex(0x1b1200));
+    make_btn(bar, "RESUME", 84,  8, 92,  40, COL_IDLE,  cmd_cb, CMD_RESUME, FONT_HBAR);
+    make_btn(bar, "RESET",  182, 8, 78,  40, COL_ALARM, cmd_cb, CMD_STOP,   FONT_HBAR);
+
+    // Wide state chip.
+    g_stateChip = make_panel(bar, 266, 8, 150, 40);
+    g_stateLbl = lv_label_create(g_stateChip);
+    lv_label_set_text(g_stateLbl, "DISCONNECTED");
+    lv_obj_set_style_text_font(g_stateLbl, FONT_HBAR, 0);
+    lv_obj_set_style_text_color(g_stateLbl, COL_TEXT, 0);
+    lv_obj_center(g_stateLbl);
+
+    // Network / IP area (tap to open the WiFi screen).
+    g_netBtn = lv_btn_create(bar);
+    lv_obj_set_size(g_netBtn, 150, 40);
+    lv_obj_set_pos(g_netBtn, 422, 8);
+    style_btn(g_netBtn, COL_PANEL);
+    lv_obj_add_event_cb(g_netBtn, net_cb, LV_EVENT_CLICKED, nullptr);
+    g_netLbl = lv_label_create(g_netBtn);
+    lv_label_set_text(g_netLbl, LV_SYMBOL_WIFI "  --");
+    lv_obj_set_style_text_font(g_netLbl, FONT_HBAR, 0);
+    lv_obj_set_style_text_color(g_netLbl, COL_MUTED, 0);
+    lv_obj_center(g_netLbl);
+
+    const char *names[2] = {"CONTROL", "JOBS"};
+    for (int i = 0; i < 2; i++)
+        g_tabBtns[i] = make_btn(bar, names[i], 580 + i * 108, 8, 104, 40,
+                                COL_PANEL, tab_cb, i, FONT_HBAR);
+}
+
+// ===========================================================================
+//  Control view: DRO
+// ===========================================================================
+static void build_dro(lv_obj_t *view)
+{
+    lv_obj_t *p = make_panel(view, 8, 6, 468, 180);
+
+    lv_obj_t *title = lv_label_create(p);
+    lv_label_set_text(title, "POSITION");
+    lv_obj_set_style_text_color(title, COL_ACCENT, 0);   // readable, not near-invisible grey
+    lv_obj_set_style_text_font(title, FONT_SM, 0);
+    lv_obj_set_pos(title, 14, 9);
+
+    static const char *posMap[] = {"WORK", "MACH", ""};
+    g_posToggle = lv_btnmatrix_create(p);
+    lv_obj_set_size(g_posToggle, 150, 28);
+    lv_obj_set_pos(g_posToggle, 310, 4);
+    lv_btnmatrix_set_map(g_posToggle, posMap);
+    lv_btnmatrix_set_btn_ctrl_all(g_posToggle, LV_BTNMATRIX_CTRL_CHECKABLE);
+    lv_btnmatrix_set_one_checked(g_posToggle, true);
+    lv_btnmatrix_set_btn_ctrl(g_posToggle, 0, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_set_style_text_font(g_posToggle, FONT_TINY, 0);
+    lv_obj_set_style_pad_all(g_posToggle, 2, 0);
+    lv_obj_set_style_bg_opa(g_posToggle, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_posToggle, 0, 0);
+    lv_obj_add_event_cb(g_posToggle, posmode_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    // Three evenly-spaced rows. The axis letter stays pinned at the left, but
+    // the big numeric readout is CENTERED across the full panel width so the
+    // block reads balanced instead of crammed against the left. The alternate
+    // (M/W) coordinate sits small at the right edge of each row.
+    static const char *names[3] = {"X", "Y", "Z"};
+    for (int i = 0; i < 3; i++) {
+        int y = 40 + i * 46;
+
+        lv_obj_t *ax = lv_label_create(p);
+        lv_label_set_text(ax, names[i]);
+        lv_obj_set_style_text_color(ax, COL_ACCENT, 0);
+        lv_obj_set_style_text_font(ax, FONT_LG, 0);
+        lv_obj_set_pos(ax, 18, y + 8);
+
+        g_axisBig[i] = lv_label_create(p);
+        lv_label_set_text(g_axisBig[i], "0.000");
+        lv_obj_set_style_text_color(g_axisBig[i], COL_TEXT, 0);
+        lv_obj_set_style_text_font(g_axisBig[i], FONT_DRO, 0);
+        lv_obj_set_width(g_axisBig[i], lv_pct(100));
+        lv_obj_set_style_text_align(g_axisBig[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(g_axisBig[i], 0, y);
+
+        g_axisSmall[i] = lv_label_create(p);
+        lv_label_set_text(g_axisSmall[i], "M 0.000");
+        lv_obj_set_style_text_color(g_axisSmall[i], COL_MUTED, 0);
+        lv_obj_set_style_text_font(g_axisSmall[i], FONT_SM, 0);
+        lv_obj_set_width(g_axisSmall[i], 118);
+        lv_obj_set_style_text_align(g_axisSmall[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_pos(g_axisSmall[i], 342, y + 16);
+    }
+}
+
+static void build_job_strip(lv_obj_t *view)
+{
+    lv_obj_t *p = make_panel(view, 8, 190, 468, 30);
+    g_jobStripLbl = lv_label_create(p);
+    lv_label_set_text(g_jobStripLbl, LV_SYMBOL_FILE "  No job loaded");
+    lv_obj_set_style_text_color(g_jobStripLbl, COL_MUTED, 0);
+    lv_obj_set_style_text_font(g_jobStripLbl, FONT_SM, 0);
+    lv_obj_align(g_jobStripLbl, LV_ALIGN_LEFT_MID, 10, 0);
+}
+
+static void build_console(lv_obj_t *view)
+{
+    g_console = lv_textarea_create(view);
+    lv_obj_set_size(g_console, 468, 194);
+    lv_obj_set_pos(g_console, 8, 224);
+    lv_textarea_set_cursor_click_pos(g_console, false);
+    lv_obj_clear_flag(g_console, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_set_scroll_dir(g_console, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(g_console, LV_SCROLLBAR_MODE_ON);
+    lv_obj_set_style_bg_color(g_console, lv_color_hex(0x0C0E11), 0);
+    lv_obj_set_style_border_width(g_console, 1, 0);
+    lv_obj_set_style_border_color(g_console, COL_LINE, 0);
+    lv_obj_set_style_radius(g_console, 8, 0);
+    lv_obj_set_style_text_color(g_console, COL_ACCENT, 0);
+    lv_obj_set_style_text_font(g_console, FONT_MONO, 0);
+    lv_textarea_set_text(g_console, "");
+}
+
+// ===========================================================================
+//  Control view: jog cross + cluster (right column)
+// ===========================================================================
+static lv_obj_t *make_jog_btn(lv_obj_t *p, const char *text, int x, int y, int w, int h,
+                              int axis, int sign)
+{
+    lv_obj_t *b = lv_btn_create(p);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_pos(b, x, y);
+    style_btn(b, COL_PANEL);
+    lv_obj_add_event_cb(b, jog_cb, LV_EVENT_CLICKED, (void *)jogCode(axis, sign));
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, FONT_LG, 0);
+    lv_obj_set_style_text_color(l, COL_ACCENT, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void build_jog_cluster(lv_obj_t *view)
+{
+    // Distance + feed selectors on one row. Each has its units in a small
+    // header ABOVE the dropdown; the feed dropdown fills the remaining width to
+    // the right-column grid edge (RX0 + RW).
+    const int distW = 130;
+    const int feedX = RX0 + distW + GAP;
+    const int feedW = RW - distW - GAP;          // fills to RX0 + RW
+    make_hdr(view, "DISTANCE (mm)", RX0, 6);
+    make_hdr(view, "FEED (mm/min)", feedX, 6);
+
+    lv_obj_t *dist = lv_dropdown_create(view);
+    lv_dropdown_set_options(dist, "0.1\n1\n10\n50\n100");
+    lv_dropdown_set_selected(dist, 1);
+    lv_obj_set_size(dist, distW, 38);
+    lv_obj_set_pos(dist, RX0, 26);
+    lv_obj_set_style_text_font(dist, FONT_MD, 0);
+    lv_obj_add_event_cb(dist, dist_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_t *feed = lv_dropdown_create(view);
+    lv_dropdown_set_options(feed, "100\n500\n1000\n2000");
+    lv_dropdown_set_selected(feed, 2);
+    lv_obj_set_size(feed, feedW, 38);
+    lv_obj_set_pos(feed, feedX, 26);
+    lv_obj_set_style_text_font(feed, FONT_MD, 0);
+    lv_obj_add_event_cb(feed, feed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    // Jog cross on a 4-col grid: cols 0-2 = XY, col 3 = Z.
+    const int jw = cellW(4), jh = 58;
+    const int r0 = 80, r1 = r0 + jh + GAP, r2 = r1 + jh + GAP;
+    make_jog_btn(view, "Y+", cellX(1, 4), r0, jw, jh, 1, +1);
+    make_jog_btn(view, "X-", cellX(0, 4), r1, jw, jh, 0, -1);
+    make_jog_btn(view, "X+", cellX(2, 4), r1, jw, jh, 0, +1);
+    make_jog_btn(view, "Y-", cellX(1, 4), r2, jw, jh, 1, -1);
+    make_jog_btn(view, "Z+", cellX(3, 4), r0, jw, jh, 2, +1);
+    make_jog_btn(view, "Z-", cellX(3, 4), r2, jw, jh, 2, -1);
+    make_btn(view, "HOME\nXY", cellX(1, 4), r1, jw, jh, COL_PANEL_HI, cmd_cb, CMD_HOME_XY, FONT_BTN, COL_ACCENT);
+    make_btn(view, "HOME\nZ",  cellX(3, 4), r1, jw, jh, COL_PANEL_HI, cmd_cb, CMD_HOME_Z,  FONT_BTN, COL_ACCENT);
+
+    const int cy0 = r2 + jh + 14;
+    make_btn(view, "ZERO X", cellX(0, 3), cy0, cellW(3), 40, COL_PANEL, cmd_cb, CMD_ZERO_X, FONT_BTN);
+    make_btn(view, "ZERO Y", cellX(1, 3), cy0, cellW(3), 40, COL_PANEL, cmd_cb, CMD_ZERO_Y, FONT_BTN);
+    make_btn(view, "ZERO Z", cellX(2, 3), cy0, cellW(3), 40, COL_PANEL, cmd_cb, CMD_ZERO_Z, FONT_BTN);
+
+    const int cy1 = cy0 + 48;
+    make_btn(view, "ZERO ALL", cellX(0, 2), cy1, cellW(2), 40, COL_ACCENT, cmd_cb, CMD_ZERO_ALL, FONT_BTN, lv_color_hex(0x03201E));
+    make_btn(view, "HOME ALL", cellX(1, 2), cy1, cellW(2), 40, COL_PANEL, cmd_cb, CMD_HOME_ALL, FONT_BTN);
+
+    const int cy2 = cy1 + 48;
+    make_btn(view, "UNLOCK $X", cellX(0, 1), cy2, cellW(1), 40, COL_PANEL, cmd_cb, CMD_UNLOCK, FONT_BTN);
+}
+
+static void build_control_view(lv_obj_t *view)
+{
+    build_dro(view);
+    build_job_strip(view);
+    build_console(view);
+    build_jog_cluster(view);
+}
+
+// ===========================================================================
+//  Jobs view
+// ===========================================================================
+static void rebuild_job_list()
+{
+    if (!g_jobList) return;
+    lv_obj_clean(g_jobList);
+    g_jobPaths.clear();
+
+    std::vector<JobEntry> files;
+    store_list(files);
+
+    if (files.empty()) {
+        lv_obj_t *l = lv_label_create(g_jobList);
+        lv_label_set_text(l, store_sd_ready()
+                          ? "No jobs. Upload .nc/.gcode files over the web UI."
+                          : "SD unavailable - using flash. Upload jobs over the web UI.");
+        lv_obj_set_style_text_color(l, COL_MUTED, 0);
+        lv_obj_set_style_text_font(l, FONT_SM, 0);
+        return;
+    }
+
+    for (size_t i = 0; i < files.size(); i++) {
+        JobEntry &f = files[i];
+        g_jobPaths.push_back(f.vpath);
+
+        lv_obj_t *row = lv_obj_create(g_jobList);
+        lv_obj_set_size(row, lv_pct(100), 48);
+        lv_obj_set_style_bg_color(row, COL_PANEL, 0);
+        lv_obj_set_style_border_color(row, COL_LINE, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *nm = lv_label_create(row);
+        char buf[80];
+        snprintf(buf, sizeof(buf), "%s   [%s]  %u B", f.name.c_str(), f.onSd ? "SD" : "FLASH", (unsigned)f.size);
+        lv_label_set_text(nm, buf);
+        lv_obj_set_style_text_color(nm, COL_TEXT, 0);
+        lv_obj_set_style_text_font(nm, FONT_SM, 0);
+        lv_obj_align(nm, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *del = make_btn(row, LV_SYMBOL_TRASH, 0, 0, 56, 34, COL_PANEL_HI, del_job_cb, (intptr_t)i, FONT_BTN, COL_ALARM);
+        lv_obj_align(del, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_t *run = make_btn(row, "RUN", 0, 0, 72, 34, COL_ACCENT, run_job_cb, (intptr_t)i, FONT_BTN, lv_color_hex(0x03201E));
+        lv_obj_align(run, LV_ALIGN_RIGHT_MID, -62, 0);
+    }
+}
+
+static void build_jobs_view(lv_obj_t *view)
+{
+    g_jobCurLbl = lv_label_create(view);
+    lv_label_set_text(g_jobCurLbl, "Current job: none");
+    lv_obj_set_style_text_color(g_jobCurLbl, COL_TEXT, 0);
+    lv_obj_set_style_text_font(g_jobCurLbl, FONT_H1, 0);
+    lv_obj_set_pos(g_jobCurLbl, 8, 8);
+
+    make_btn(view, "REFRESH", 700, 6, 92, 36, COL_PANEL, cmd_cb, CMD_JOB_REFRESH, FONT_BTN);
+
+    g_jobBar = lv_bar_create(view);
+    lv_obj_set_size(g_jobBar, 600, 16);
+    lv_obj_set_pos(g_jobBar, 8, 44);
+    lv_bar_set_range(g_jobBar, 0, 100);
+    lv_bar_set_value(g_jobBar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(g_jobBar, COL_PANEL_HI, 0);
+    lv_obj_set_style_bg_color(g_jobBar, COL_ACCENT, LV_PART_INDICATOR);
+
+    g_jobPctLbl = lv_label_create(view);
+    lv_label_set_text(g_jobPctLbl, "0%");
+    lv_obj_set_style_text_color(g_jobPctLbl, COL_MUTED, 0);
+    lv_obj_set_style_text_font(g_jobPctLbl, FONT_SM, 0);
+    lv_obj_set_pos(g_jobPctLbl, 616, 42);
+
+    make_btn(view, "PAUSE",  8,   70, 120, 38, COL_HOLD,  cmd_cb, CMD_JOB_PAUSE,  FONT_BTN, lv_color_hex(0x1b1200));
+    make_btn(view, "RESUME", 136, 70, 120, 38, COL_IDLE,  cmd_cb, CMD_JOB_RESUME, FONT_BTN);
+    make_btn(view, "STOP",   264, 70, 120, 38, COL_ALARM, cmd_cb, CMD_JOB_STOP,   FONT_BTN);
+
+    lv_obj_t *hdr = lv_label_create(view);
+    lv_label_set_text(hdr, "STORED JOBS  (microSD + flash)");
+    lv_obj_set_style_text_color(hdr, COL_MUTED, 0);
+    lv_obj_set_style_text_font(hdr, FONT_SM, 0);
+    lv_obj_set_pos(hdr, 8, 118);
+
+    g_jobList = lv_obj_create(view);
+    lv_obj_set_size(g_jobList, 784, 268);
+    lv_obj_set_pos(g_jobList, 8, 140);
+    lv_obj_set_style_bg_color(g_jobList, COL_BG2, 0);
+    lv_obj_set_style_border_color(g_jobList, COL_LINE, 0);
+    lv_obj_set_style_border_width(g_jobList, 1, 0);
+    lv_obj_set_style_radius(g_jobList, 8, 0);
+    lv_obj_set_style_pad_all(g_jobList, 8, 0);
+    lv_obj_set_style_pad_row(g_jobList, 6, 0);
+    lv_obj_set_flex_flow(g_jobList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(g_jobList, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(g_jobList, LV_SCROLLBAR_MODE_AUTO);
+}
+
+// ===========================================================================
+//  WiFi view
+// ===========================================================================
+static void build_wifi_view(lv_obj_t *view)
+{
+    lv_obj_t *t = lv_label_create(view);
+    lv_label_set_text(t, "WIFI");
+    lv_obj_set_style_text_color(t, COL_TEXT, 0);
+    lv_obj_set_style_text_font(t, FONT_H1, 0);
+    lv_obj_set_pos(t, 8, 8);
+
+    g_wifiStatus = lv_label_create(view);
+    lv_label_set_text(g_wifiStatus, "Mode: --   IP: --");
+    lv_obj_set_style_text_color(g_wifiStatus, COL_MUTED, 0);
+    lv_obj_set_style_text_font(g_wifiStatus, FONT_SM, 0);
+    lv_obj_set_pos(g_wifiStatus, 120, 14);
+
+    make_btn(view, "SCAN",   8,   44, 104, 40, COL_PANEL, cmd_cb, CMD_WIFI_SCAN,   FONT_BTN);
+    make_btn(view, "FORGET", 560, 44, 120, 40, COL_PANEL, cmd_cb, CMD_WIFI_FORGET, FONT_BTN, COL_ALARM);
+
+    g_ssidDrop = lv_dropdown_create(view);
+    lv_dropdown_set_options(g_ssidDrop, "(scan for networks)");
+    lv_obj_set_size(g_ssidDrop, 420, 40);
+    lv_obj_set_pos(g_ssidDrop, 120, 44);
+    lv_obj_set_style_text_font(g_ssidDrop, FONT_MD, 0);
+
+    g_pass = lv_textarea_create(view);
+    lv_textarea_set_one_line(g_pass, true);
+    lv_textarea_set_password_mode(g_pass, true);
+    lv_textarea_set_placeholder_text(g_pass, "WiFi password");
+    lv_obj_set_size(g_pass, 420, 44);
+    lv_obj_set_pos(g_pass, 8, 96);
+    lv_obj_set_style_text_font(g_pass, FONT_MD, 0);
+    lv_obj_add_event_cb(g_pass, pass_focus_cb, LV_EVENT_CLICKED, nullptr);
+
+    make_btn(view, "CONNECT", 440, 96, 120, 44, COL_ACCENT, cmd_cb, CMD_WIFI_CONNECT, FONT_BTN, lv_color_hex(0x03201E));
+
+    g_kb = lv_keyboard_create(view);
+    lv_obj_set_size(g_kb, 800, 210);
+    lv_obj_align(g_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(g_kb, g_pass);
+    lv_obj_add_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(g_kb, kb_event_cb, LV_EVENT_ALL, nullptr);
+}
+
+// ===========================================================================
+//  View switching
+// ===========================================================================
+static void show_view(int i)
+{
+    for (int k = 0; k < 3; k++) {
+        if (k == i) lv_obj_clear_flag(g_views[k], LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_add_flag(g_views[k], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int k = 0; k < 2; k++) {
+        bool active = (k == i);
+        lv_obj_set_style_bg_color(g_tabBtns[k], active ? COL_PANEL_HI : COL_PANEL, 0);
+        lv_obj_set_style_border_color(g_tabBtns[k], active ? COL_ACCENT : COL_LINE, 0);
+        lv_obj_t *lbl = lv_obj_get_child(g_tabBtns[k], 0);
+        lv_obj_set_style_text_color(lbl, active ? COL_ACCENT : COL_MUTED, 0);
+    }
+    lv_obj_set_style_border_color(g_netBtn, (i == 2) ? COL_ACCENT : COL_LINE, 0);
+
+    if (i == 1) rebuild_job_list();
+}
+
+// ===========================================================================
+//  Init
+// ===========================================================================
+void ui_init()
+{
+    lv_disp_t *disp = lv_disp_get_default();
+    lv_theme_t *th = lv_theme_default_init(disp, COL_ACCENT, COL_MUTED, true, FONT_MD);
+    lv_disp_set_theme(disp, th);
+
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, COL_BG, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    build_header(scr);
+
+    for (int i = 0; i < 3; i++) {
+        g_views[i] = lv_obj_create(scr);
+        lv_obj_set_size(g_views[i], 800, 420);
+        lv_obj_set_pos(g_views[i], 0, 60);
+        lv_obj_set_style_bg_color(g_views[i], COL_BG, 0);
+        lv_obj_set_style_bg_opa(g_views[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(g_views[i], 0, 0);
+        lv_obj_set_style_radius(g_views[i], 0, 0);
+        lv_obj_set_style_pad_all(g_views[i], 0, 0);
+        lv_obj_clear_flag(g_views[i], LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    build_control_view(g_views[0]);
+    build_jobs_view(g_views[1]);
+    build_wifi_view(g_views[2]);
+
+    show_view(0);
+    ui_console_log("pendant ready - waiting for GRBL...", false);
+}
+
+// ===========================================================================
+//  Refresh from GRBL snapshot (+ WiFi + job state)
+// ===========================================================================
+void ui_refresh(const GrblSnapshot &s)
+{
+    static bool prevConn = false;
+    if (s.connected && !prevConn)      ui_console_log(String("UART link up - GRBL ") + s.stateName, false);
+    else if (!s.connected && prevConn) ui_console_log("UART link lost", false);
+    prevConn = s.connected;
+
+    // ---- State chip ----
+    lv_color_t col = COL_OFF;
+    const char *txt = "DISCONNECTED";
+    if (s.connected) {
+        txt = s.stateName;
+        switch (s.state) {
+            case GrblState::Idle:  col = COL_IDLE;  break;
+            case GrblState::Run:
+            case GrblState::Jog:
+            case GrblState::Home:  col = COL_RUN;   break;
+            case GrblState::Hold:  col = COL_HOLD;  break;
+            case GrblState::Alarm:
+            case GrblState::Door:  col = COL_ALARM; break;
+            default:               col = COL_OFF;   break;
+        }
+    }
+    lv_obj_set_style_bg_color(g_stateChip, col, 0);
+    lv_label_set_text(g_stateLbl, txt);
+
+    // ---- DRO ----
+    const float *big   = g_showWork ? s.wpos : s.mpos;
+    const float *small = g_showWork ? s.mpos : s.wpos;
+    const char  *tag   = g_showWork ? "M" : "W";
+    for (int i = 0; i < 3; i++) {
+        char b[16];
+        snprintf(b, sizeof(b), "%.3f", big[i]);
+        lv_label_set_text(g_axisBig[i], b);
+        char sm[24];
+        snprintf(sm, sizeof(sm), "%s %.3f", tag, small[i]);
+        lv_label_set_text(g_axisSmall[i], sm);
+    }
+
+    // ---- Job progress (strip + jobs view) ----
+    if (Grbl.jobActive()) {
+        int pct = (int)(Grbl.jobProgress() * 100.0f);
+        char b[80];
+        snprintf(b, sizeof(b), LV_SYMBOL_FILE "  %s  %u/%u  %d%%%s",
+                 Grbl.jobName().c_str(), (unsigned)Grbl.jobLinesDone(),
+                 (unsigned)Grbl.jobTotalLines(), pct, Grbl.jobPaused() ? "  (paused)" : "");
+        lv_label_set_text(g_jobStripLbl, b);
+        lv_label_set_text_fmt(g_jobCurLbl, "Current job: %s%s", Grbl.jobName().c_str(),
+                              Grbl.jobPaused() ? "  (paused)" : "");
+        lv_bar_set_value(g_jobBar, pct, LV_ANIM_OFF);
+        lv_label_set_text_fmt(g_jobPctLbl, "%d%%", pct);
+    } else {
+        lv_label_set_text(g_jobStripLbl, LV_SYMBOL_FILE "  No job loaded");
+        lv_label_set_text(g_jobCurLbl, "Current job: none");
+        lv_bar_set_value(g_jobBar, 0, LV_ANIM_OFF);
+        lv_label_set_text(g_jobPctLbl, "0%");
+    }
+
+    // ---- Network indicator + WiFi status ----
+    const char *wmode = wifi_mode_str();
+    bool wup = wifi_up();
+    String ip = wifi_ip();
+    lv_label_set_text_fmt(g_netLbl, LV_SYMBOL_WIFI "  %s %s", wmode,
+                          ip.length() ? ip.c_str() : "--");
+    lv_obj_set_style_text_color(g_netLbl, wup ? COL_ACCENT : COL_MUTED, 0);
+    if (g_wifiStatus)
+        lv_label_set_text_fmt(g_wifiStatus, "Mode: %s   IP: %s   SSID: %s",
+                              wmode, ip.length() ? ip.c_str() : "--",
+                              wifi_ssid().length() ? wifi_ssid().c_str() : "--");
+
+    // ---- WiFi scan poll ----
+    if (g_scanPending) {
+        int n = wifi_scan_poll(g_ssids);
+        if (n >= 0) {
+            g_scanPending = false;
+            String opts;
+            if (g_ssids.empty()) {
+                opts = "(no networks found)";
+            } else {
+                for (size_t i = 0; i < g_ssids.size(); i++) {
+                    if (i) opts += "\n";
+                    opts += g_ssids[i].ssid;
+                }
+            }
+            if (g_ssidDrop) lv_dropdown_set_options(g_ssidDrop, opts.c_str());
+        }
+    }
+}
+
+// ===========================================================================
+//  Console
+// ===========================================================================
+static void render_console()
 {
     if (!g_console) return;
-    // Keep the textarea from growing without bound.
-    const char *cur = lv_textarea_get_text(g_console);
-    if (cur && strlen(cur) > 5000) lv_textarea_set_text(g_console, "");
-    lv_textarea_add_text(g_console, outgoing ? "> " : "  ");
-    lv_textarea_add_text(g_console, line.c_str());
-    lv_textarea_add_text(g_console, "\n");
+    String text;
+    text.reserve(g_log.size() * 24);
+    for (auto &l : g_log) { text += l; text += '\n'; }
+    lv_textarea_set_text(g_console, text.c_str());
+    lv_textarea_set_cursor_pos(g_console, LV_TEXTAREA_CURSOR_LAST);
 }
+
+void ui_console_log(const String &line, bool outgoing)
+{
+    g_log.push_back(String(outgoing ? "> " : "< ") + line);
+    while (g_log.size() > 200) g_log.pop_front();
+    render_console();
+}
+
+void ui_set_job(const String &name)
+{
+    if (!g_jobStripLbl) return;
+    if (name.length())
+        lv_label_set_text(g_jobStripLbl, (String(LV_SYMBOL_FILE "  ") + name).c_str());
+    else
+        lv_label_set_text(g_jobStripLbl, LV_SYMBOL_FILE "  No job loaded");
+}
+
+// ===========================================================================
+//  Shared display mode (with the web UI)
+// ===========================================================================
+void ui_set_pos_mode(bool showWork)
+{
+    g_showWork = showWork;
+    if (g_posToggle) {
+        lv_btnmatrix_set_btn_ctrl(g_posToggle, showWork ? 0 : 1, LV_BTNMATRIX_CTRL_CHECKED);
+        lv_btnmatrix_clear_btn_ctrl(g_posToggle, showWork ? 1 : 0, LV_BTNMATRIX_CTRL_CHECKED);
+    }
+}
+
+bool ui_get_pos_mode() { return g_showWork; }

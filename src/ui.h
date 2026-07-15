@@ -1,44 +1,23 @@
 /*
- * ui.h - Public interfaces for the pendant UI plus the job-store and web
- *        uploader.
+ * ui.h - LVGL touchscreen UI for the CNC control pendant (800x480 landscape).
  *
- * NOTE: JobStore and WebUI are declared here (rather than in their own
- * headers) and implemented in main.cpp. All Ui:: functions must run inside the
- * LVGL task; main.cpp drives create()/tick() from LVGL timers.
+ * The UI is created once with ui_init() and refreshed from the GRBL snapshot
+ * with ui_refresh(). Console output is appended with ui_console_log(), and the
+ * current job label is driven with ui_set_job(). The work/machine display mode
+ * is shared with the web UI via ui_get/ set_pos_mode().
+ *
+ * All of these run inside the LVGL task (see main.cpp), so no extra locking is
+ * required between them and the widget tree.
  */
 #pragma once
 
-#include <Arduino.h>
-#include <vector>
-#include "config.h"
+#include "grbl.h"
 
-// --- G-code job files stored in flash (LittleFS) ---------------------------
-struct JobFile {
-    String   name;      // basename, e.g. "part.nc"
-    uint32_t size;      // bytes
-};
+void ui_init();
+void ui_refresh(const GrblSnapshot &s);
+void ui_console_log(const String &line, bool outgoing);
+void ui_set_job(const String &name);
 
-namespace JobStore {
-    bool begin();                          // mount FS, ensure JOBS_DIR exists
-    std::vector<JobFile> list();           // jobs sorted by name
-    String fullPath(const String &name);   // JOBS_DIR + "/" + name
-    bool remove(const String &name);
-    uint64_t totalBytes();
-    uint64_t usedBytes();
-}
-
-// --- WiFi + HTTP uploader --------------------------------------------------
-namespace WebUI {
-    void   begin();
-    void   handle();                 // call from loop()
-    String ipAddress();
-    String ssid();
-    bool   isUploading();            // true while a file transfer is in progress
-}
-
-// --- Touchscreen interface -------------------------------------------------
-namespace Ui {
-    void create();                                  // build the screen
-    void tick();                                    // refresh from GRBL state
-    void logLine(const String &line, bool outgoing);// append to the console
-}
+// Work vs machine coordinate display mode (shared with the web UI).
+void ui_set_pos_mode(bool showWork);
+bool ui_get_pos_mode();

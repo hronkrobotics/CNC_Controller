@@ -51,39 +51,101 @@ bidirectional logic level converter (BSS138 type):
 ## Firmware (ESP32-S3 pendant)
 
 A [PlatformIO](https://platformio.org/) project. The ESP32-S3 is the serial
-master to GRBL and renders the touch UI.
+master to GRBL, renders the touch UI, **and mirrors the whole machine to a web
+UI over WiFi** — the machine state is a single source of truth shared by both.
 
-**Current scope — control pendant:**
+### Architecture
 
-- Color-coded status bar (Idle / Run / Jog / Hold / Alarm / Disconnected)
-- Large X/Y/Z **DRO** with a work/machine (WPos/MPos) toggle
-- **Jog** cross (X/Y/Z ±) with step-size (`0.01 / 0.1 / 1 / 10` mm) and feed-rate
-  selectors, plus a Step/Continuous toggle and jog-cancel
+```
+   PC (G-code sender)                 Phone / laptop browser
+        │ native USB CDC                     │ WiFi (HTTP + WebSocket)
+        ▼                                    ▼
+  ┌───────────────────────── ESP32-S3 pendant ─────────────────────────┐
+  │  usbfeed ─┐                                    ┌─ webserver (loop task)│
+  │           ▼                                    ▼   HTTP UI / REST / WS │
+  │        ┌─────────── machine (single source of truth) ───────────┐     │
+  │        │  cmd queue  ·  state snapshot  ·  log queue (thread-safe)│    │
+  │        └───────────────────────▲──────────────────────────────┘      │
+  │   LVGL UI ◄──┐                  │ publish / drain (LVGL task)          │
+  │   (display)  └── grbl ◄─ streamer ◄─ jobstore ◄─ SD + LittleFS         │
+  └───────┬─────────────────────────────────────────────────────────────┘
+          │ UART1 GPIO43/44 → level shifter → Uno pins 0/1
+          ▼
+     Arduino Uno + CNC shield (GRBL 1.1)
+```
+
+**Threading:** GRBL, command execution and the LVGL widget tree are all owned by
+the **LVGL task** (via `lv_timer`), so GRBL is only ever touched from one place.
+WiFi + the web server run on the **`loop()` task**. The two communicate *only*
+through the thread-safe `machine_*` API (commands in, state snapshot + console
+log out). This keeps the display and browser perfectly in sync with no locks on
+the GRBL core, and keeps network traffic off the timing-sensitive RGB refresh.
+
+### Features
+
+- Color-coded status chip (Idle / Run / Jog / Hold / Alarm / Disconnected)
+- Large X/Y/Z **DRO** with a segmented **WORK/MACH** toggle (synced to the web)
+- **Jog** cross (X/Y/Z ±) with `0.1 / 1 / 10 / 50 / 100` mm step + feed selector
+  (units shown as *mm/min*), integrated **Home XY / Home Z**, jog-cancel
 - **Zero** X / Y / Z / All, **Home** (`$H`), **Unlock** (`$X`)
-- Always-visible **Feed-Hold / Resume / Soft-Reset (Stop)** buttons
-- Scrolling **console** of everything sent to and received from GRBL
+- Always-visible **Feed-Hold / Resume / Soft-Reset (Stop)**
+- Scrollable **console** of everything sent to / received from GRBL
+- **JOBS** screen: list stored jobs (SD + flash), **Run** with a progress bar
+  (line count + %), **Pause / Resume / Stop**
+- **WiFi** screen: SSID scan + on-screen-keyboard password entry, saved to NVS;
+  header shows WiFi mode + IP (tap it to open the WiFi screen)
+- **Web mirror**: a browser at the pendant's IP shows the same DRO, status,
+  console, jog/zero/home/unlock, hold/resume/stop and jobs — plus **G-code file
+  upload**. Live state is pushed over a WebSocket.
 
-**Roadmap:**
+### Three ways to run G-code
 
-- Inline **USB-serial bridge** so a laptop sender (CNCjs) can run jobs *through*
-  the pendant while the screen jogs and shows the DRO — no WiFi required
-- Optional on-board job storage (flash / SD) and WiFi upload as later add-ons
+1. **Wired USB** — a PC on the ESP32-S3's **native USB port** (a COM port) streams
+   G-code straight to GRBL through the char-counting queue. Always available,
+   independent of WiFi. Real-time bytes (`?`, `!`, `~`, Ctrl-X, `0x85`) pass
+   through; GRBL replies are echoed back to the PC.
+2. **Stored job** — upload `.nc/.gcode/.ngc/.tap/.txt` over the web UI to SD (or
+   flash), then **Run** it from the JOBS screen or the browser.
+3. **Web stream** — send `gcode` commands from the browser console field.
 
 ### Build & flash
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
-pio run                 # build
-pio run -t upload       # build + flash
-pio device monitor      # serial log (115200)
+pio run                                          # build
+pio run -t upload --upload-port /dev/ttyACM0     # build + flash
 ```
 
-Flash over the board's **"UART" USB-C port** (with the UART switch on the USB
-side). If upload can't sync, hold **BOOT**, tap **RESET**, release **BOOT**.
+Flashing uses the ESP32-S3 **native USB port** (`/dev/ttyACM0` here). That same
+port is the PC G-code feed at runtime. `CORE_DEBUG_LEVEL=0` keeps it clean for a
+G-code sender; bump it in `platformio.ini` for verbose bring-up logs. If upload
+can't sync, hold **BOOT**, tap **RESET**, release **BOOT**.
+
+> The web UI is embedded in firmware (`src/web_index.h`, served from PROGMEM), so
+> a single `pio run -t upload` ships everything — no separate filesystem upload.
 
 The display, GT911 touch, backlight, and CH422G IO-expander are handled by
 Espressif's `ESP32_Display_Panel` supported-board profile
 `BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7`.
+
+### WiFi / web
+
+- First boot (no saved credentials) starts a **SoftAP** `CNC-Pendant` /
+  `cnc12345`. Join it and browse to `http://192.168.4.1`, or use the on-display
+  **WiFi** screen to scan + join your network (credentials persist in NVS).
+- If a saved network can't be joined it falls back to the AP, so the UI is always
+  reachable. Web = HTTP UI + REST on **:80**, WebSocket mirror on **:81**.
+- Disable networking entirely with `ENABLE_WIFI 0` in `src/config.h`.
+
+### microSD (CS on CH422G EXIO4)
+
+Per the board schematic the SD card is on SPI (`MOSI=11 / SCK=12 / MISO=13`) with
+its chip-select on the **CH422G IO expander at EXIO4**, not a GPIO. The firmware
+grabs the expander from the initialized Board object
+(`board->getIO_Expander()->getBase()`), asserts EXIO4 low to select the card, and
+mounts it. **This is verified against the schematic but NEEDS ON-HARDWARE
+VERIFICATION.** SD is fully optional: if it doesn't mount, the pendant runs
+normally on flash (LittleFS) and the UI reports SD unavailable.
 
 ### Recommended GRBL settings (GRBL 1.1 defaults are fine)
 
@@ -99,11 +161,33 @@ Espressif's `ESP32_Display_Panel` supported-board profile
 | `platformio.ini` | build config, board, libraries |
 | `boards/BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_7.json` | 16 MB flash / 8 MB OPI PSRAM board def |
 | `partitions.csv` | partition table |
-| `src/config.h` | pins, baud, jog defaults, feature stubs — **edit me** |
-| `src/grbl.*` | GRBL serial protocol + status parser |
-| `src/ui.*` | LVGL touchscreen interface |
-| `src/main.cpp` | board/LVGL init and service loop |
+| `src/config.h` | pins, baud, jog defaults, **feature toggles**, WiFi/web/SD — **edit me** |
+| `src/grbl.*` | GRBL serial protocol, status parser, char-counting streamer |
+| `src/machine.*` | single-source-of-truth state + cross-task command/log queues |
+| `src/ui.*` | LVGL touchscreen interface (Control / Jobs / WiFi screens) |
+| `src/usbfeed.*` | native-USB-CDC G-code input bridge |
+| `src/sdcard.*` | microSD over SPI, CS on CH422G EXIO4 (failsafe) |
+| `src/jobstore.*` | unified job store over SD + LittleFS (list/upload/delete) |
+| `src/wifimgr.*` | STA + AP-fallback provisioning, NVS creds, async scan |
+| `src/webserver.*` | HTTP UI + REST + WebSocket state mirror |
+| `src/web_index.h` | embedded single-page web UI (served from PROGMEM) |
+| `src/main.cpp` | board/LVGL init, task wiring, service timers |
 | `src/lvgl_v8_port.*`, `src/lv_conf.h`, `src/esp_panel_*` | display / LVGL porting (from Espressif's example) |
+
+### Feature toggles (`src/config.h`)
+
+`ENABLE_WIFI`, `ENABLE_WEB`, `ENABLE_STORAGE`, `ENABLE_SD`, `ENABLE_USB_FEED` —
+each compiles its subsystem in/out so you can strip the build down to the bare
+pendant if desired.
+
+### Fonts
+
+The UI is unified on **Montserrat** at a range of sizes (every element routes
+through a `FONT_*` define in `ui.cpp`) so there is no mixed-font patchwork. A
+"techy" TTF (Share Tech Mono for labels, DSEG7 for the DRO) was *not* embedded
+because `lv_font_conv` (node/npm) isn't available in this build environment —
+there is a documented TODO in `ui.cpp` to generate those and repoint the
+`FONT_*` defines.
 
 ---
 
