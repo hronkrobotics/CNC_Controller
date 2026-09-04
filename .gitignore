@@ -12,3 +12,6 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Local media ingest (not for GitHub)
+_media_in/
