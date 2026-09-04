@@ -275,11 +275,11 @@ String GrblController::stripGcodeLine(const String &raw)
 {
     String out;
     out.reserve(raw.length());
-    bool inParen = false;
+    int inParen = 0;
     for (size_t i = 0; i < raw.length(); i++) {
         char c = raw[i];
-        if (c == '(') { inParen = true; continue; }   // block comment
-        if (c == ')') { inParen = false; continue; }
+        if (c == '(') { inParen++; continue; }         // block comments, nested
+        if (c == ')') { if (inParen) inParen--; continue; }
         if (inParen) continue;
         if (c == ';') break;                           // line comment
         if (c == '\r' || c == '\n') continue;

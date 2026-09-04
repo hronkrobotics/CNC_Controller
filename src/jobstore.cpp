@@ -10,10 +10,32 @@ static void ensure_dir(fs::FS &fs)
     if (!fs.exists(JOBS_DIR)) fs.mkdir(JOBS_DIR);
 }
 
+// Built-in 5 min XYZ oscillation. No comments: nested parentheses in a
+// previous upload leaked "first. Finger on e-stop." to GRBL (error:2).
+static void seed_oscillate_job()
+{
+    File f = LittleFS.open(JOBS_DIR "/xyz-oscillate.nc", "w");
+    if (!f) return;
+    f.println("G21");
+    f.println("G91");
+    f.println("G94");
+    f.println("F600");
+    for (int i = 0; i < 125; i++) {
+        f.println("G1 X8 Y8 Z4");
+        f.println("G1 X-8 Y-8 Z-4");
+    }
+    f.println("G90");
+    f.println("M30");
+    f.close();
+}
+
 void store_init()
 {
     s_flashOk = LittleFS.begin(true);   // format on first boot if needed
-    if (s_flashOk) ensure_dir(LittleFS);
+    if (s_flashOk) {
+        ensure_dir(LittleFS);
+        seed_oscillate_job();           // overwrite any broken copy on flash
+    }
     if (store_sd_ready()) ensure_dir(sd_fs());
 }
 

@@ -18,7 +18,7 @@ The mill itself is not in this repository. This project is the **box** — a **1
 | HMI       | Waveshare **ESP32-S3-Touch-LCD-7** (LVGL) over UART to GRBL                          |
 | Panel I/O | 8 × M12: 4 motors, 3 endstops, 1 probe / 5 V utility                                 |
 
-**Build this:** [instructions](instructions.md) · **Wiring & mechanics:** [hardware](docs.md/hardware.md) · **Firmware:** [software](docs.md/software.md) · **CAD:** [cad/](cad/)
+**Build this:** [instructions](instructions.md) · **Wiring & mechanics:** [hardware](docs.md/hardware.md) · **Firmware:** [software](docs.md/software.md) · **CAD:** [cad/](cad/) · **Blueprint:** [control box](https://blueprint.io/s/kiuru7CEXDOqF0sPi2efXcN4hMzbg81JHDvZ05kRj7c)
 
 ![System wiring diagram](docs.md/images/diagram-system.jpg)
 
@@ -32,7 +32,7 @@ Hobby GRBL setups usually look like a Uno, a shield, and a nest of Dupont wires 
 
 The 1515 cage is the structure; PETG is the cover. Fan grills are thermoformed over a printed mold with a heat gun instead of being milled — process at the end of [instructions](instructions.md). Firmware in this repo makes the same box usable from the screen, a browser on the LAN, or a USB G-code sender.
 
-Submitted for the **[Blueprint](https://blueprint.am)** Summer Build Contest (controller-box BOM target **under US$250**).
+Submitted for the **[Blueprint](https://blueprint.io/s/kiuru7CEXDOqF0sPi2efXcN4hMzbg81JHDvZ05kRj7c)** Summer Build Contest (controller-box BOM target **under US$250**). The published Blueprint of this enclosure is at that link.
 
 ---
 
@@ -96,7 +96,7 @@ This is machine-control hardware. The panel **NC e-stop** is meant to cut **moto
 
 This project was made possible by collaboration and support from the **University of Waterloo SMART LAB**. Credit to **Professor Hamed Shahsavan**.
 
-Submitted for the **[Blueprint.am](https://blueprint.am)** hardware hackathon — credit to their platform.
+Submitted for the **[Blueprint](https://blueprint.io/s/kiuru7CEXDOqF0sPi2efXcN4hMzbg81JHDvZ05kRj7c)** hardware hackathon — credit to their platform. That URL is the published build of this control box.
 
 Firmware and prototype: **Haroon Khalid**.
 
